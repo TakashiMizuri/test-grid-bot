@@ -361,3 +361,7 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Binance candle series and the Vision zips they were unpacked from
+data/*.csv
+data/archive/
