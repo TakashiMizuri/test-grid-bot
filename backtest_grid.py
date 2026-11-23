@@ -520,12 +520,28 @@ def simulate_slots(
     stop_frac: float = 1.0,
     side: int = 1,
     leverage: float = 1.0,
+    adverse_frac: float | None = None,
+    block_rising_sma: int = 0,
+    notional_leverage: float | None = None,
+    reentry_step_block: bool = False,
+    breakeven_stop: bool = False,
+    slippage_bps: float = 0.0,
 ) -> dict:
-    """Six working slots, each fill sized to one sixth of equity. No opening seed.
+    """Six working slots. No opening seed.
+    notional_leverage is the slot size as a fraction of equity: 1.0 is 100% of the
+    deposit, 2.0 is 200%. When it is unset, qty stays on the old leverage / 6 sizing.
     side 1 is long: take-profit is the next level up, stop is stop_frac of the way
-    toward the next level down. side -1 is the same entry and the same two exit
-    prices, with the position flipped. stop_mode "band" still sells leftovers only
-    when the daily close breaks the lower band. The 20-day average only blocks entries.
+    toward the next level down. side -1 with adverse_frac unset flips those same two
+    prices. adverse_frac sets the short stop to that fraction of the step up and
+    leaves the take a full step down. reentry_step_block refuses a new short until
+    price has risen one full step above the latest stop. breakeven_stop moves the
+    stop to the entry once price has covered half the way to the take.
+    slippage_bps worsens the fill by that many basis points on entry and again
+    on exit. The order still triggers at the signal price.
+    block_rising_sma skips a new entry when today's
+    SMA20 is above the SMA20 that many calendar days earlier. Open positions still
+    exit only at their own stop or take. stop_mode "band" still sells leftovers only
+    when the daily close breaks the lower band.
     """
     sma_by_day = _sma_table(candles)
     warmup = [c for c in candles if c[0] < test_ms]
@@ -543,6 +559,11 @@ def simulate_slots(
     stops = 0
     skipped_cap = 0
     skipped_trend = 0
+    skipped_rise = 0
+    skipped_reentry = 0
+    reentry_block_px = 0.0
+    breakeven_moves = 0
+    trade_bps: list[float] = []
     recenters = 0
     win_pnl = 0.0
     loss_pnl = 0.0
@@ -589,14 +610,28 @@ def simulate_slots(
             btc = 0.0
             avg_cost = 0.0
 
+    slip = slippage_bps / 10_000
+
+    def open_fill(price: float) -> float:
+        return price * (1 - slip) if side == -1 else price * (1 + slip)
+
+    def close_fill(price: float) -> float:
+        return price * (1 + slip) if side == -1 else price * (1 - slip)
+
     levels = band_levels(entry_price, max(c[2] for c in warmup), min(c[3] for c in warmup))
     # entry, stop, target, qty — prices are fixed at the fill
     positions: list[list[float]] = []
 
     def close_at(index: int, price: float, kind: str) -> None:
-        nonlocal takes, stops, win_pnl, loss_pnl, first_stop_pnl, repeat_stop_pnl, first_stops, repeat_stops, fresh_take_pnl, reentry_take_pnl, reentry_takes, ambiguous_stops, ambiguous_stop_pnl, cash, btc, realized, sell_fills
-        entry_px, _stop, target, qty = positions.pop(index)
-        pnl = (price - entry_px) * qty * side
+        nonlocal takes, stops, win_pnl, loss_pnl, first_stop_pnl, repeat_stop_pnl, first_stops, repeat_stops, fresh_take_pnl, reentry_take_pnl, reentry_takes, ambiguous_stops, ambiguous_stop_pnl, cash, btc, realized, sell_fills, reentry_block_px
+        entry_px, _stop, target, qty = positions.pop(index)[:4]
+        entry_fill = open_fill(entry_px)
+        exit_fill = close_fill(price)
+        if entry_fill > 0:
+            trade_bps.append((exit_fill - entry_fill) / entry_fill * side * 10_000)
+        if reentry_step_block and kind != "take" and _stop > entry_px:
+            reentry_block_px = _stop + 2.0 * (_stop - entry_px)
+        pnl = (exit_fill - entry_fill) * qty * side
         if kind == "take":
             takes += 1
             win_pnl += pnl
@@ -623,10 +658,10 @@ def simulate_slots(
                 ambiguous_stop_pnl += pnl
         qty = min(qty, btc) if side == 1 else min(qty, -btc)
         if side == 1:
-            cash += qty * price * (1 - FEE)
+            cash += qty * exit_fill * (1 - FEE)
             btc -= qty
         else:
-            cash -= qty * price * (1 + FEE)
+            cash -= qty * exit_fill * (1 + FEE)
             btc += qty
         realized += pnl
         sell_fills += 1
@@ -649,27 +684,40 @@ def simulate_slots(
             full_stop = levels[i - 1]
         else:
             full_stop = price / (1 + TARGET_STEP)
-        down = price - (price - full_stop) * stop_frac
-        if target <= price or down >= price:
-            return
-        # Long: stop below, take above. Short uses the same two prices the other way.
-        adverse, favorable = (down, target) if side == 1 else (target, down)
+        if side == 1 or adverse_frac is None:
+            down = price - (price - full_stop) * stop_frac
+            if target <= price or down >= price:
+                return
+            # Long: stop below, take above. Short uses the same two prices the other way.
+            adverse, favorable = (down, target) if side == 1 else (target, down)
+        else:
+            adverse = price + (target - price) * adverse_frac
+            favorable = full_stop
+            if favorable >= price or adverse <= price:
+                return
         equity = equity_at(price)
         if equity <= 0:
             return
-        qty = equity * leverage / MAX_HOLD / price
+        if notional_leverage is None:
+            qty = equity * leverage / MAX_HOLD / price
+        else:
+            qty = equity * notional_leverage / price
+        opened = open_fill(price)
         if side == 1 and leverage <= 1:
-            qty = buy(qty, price)
+            qty = buy(qty, opened)
         elif side == 1:
-            cash -= qty * price * (1 + FEE)
+            cash -= qty * opened * (1 + FEE)
             btc += qty
             buy_fills += 1
         else:
-            cash += qty * price * (1 - FEE)
+            cash += qty * opened * (1 - FEE)
             btc -= qty
             buy_fills += 1
         if qty > 0:
-            positions.append([price, adverse, favorable, qty])
+            slot = [price, adverse, favorable, qty]
+            if breakeven_stop:
+                slot.append(price + 0.5 * (favorable - price))
+            positions.append(slot)
 
     def events(cur: float, dest: float, sma: float) -> list[tuple[float, str]]:
         down = dest < cur
@@ -688,11 +736,15 @@ def simulate_slots(
             if stop_mode == "step":
                 consider(pos[1], "stop")
             consider(pos[2], "target")
+            if breakeven_stop and len(pos) > 4 and pos[4] > 0:
+                consider(pos[4], "arm")
         consider(sma, "sma")
         return found
 
-    def walk(a: float, b: float, sma: float, buys_ok: bool) -> bool:
-        nonlocal skipped_trend
+    def walk(a: float, b: float, sma: float, buys_ok: bool, rise_block: bool) -> bool:
+        nonlocal skipped_trend, skipped_rise, skipped_reentry, reentry_block_px, breakeven_moves
+        if reentry_block_px > 0 and max(a, b) >= reentry_block_px:
+            reentry_block_px = 0.0
         cur = a
         for _ in range(500):
             if cur == b:
@@ -706,16 +758,27 @@ def simulate_slots(
                 price = min(price for price, _kind in found)
             kinds = {kind for px, kind in found if abs(px - price) <= max(1e-6, abs(price) * 1e-10)}
             # Exits first, so a stop and a new level at the same print don't double-count a slot.
+            tol = max(1e-6, abs(price) * 1e-10)
             for idx in range(len(positions) - 1, -1, -1):
-                entry_px, stop, target, _qty = positions[idx]
-                if "stop" in kinds and abs(stop - price) <= max(1e-6, abs(price) * 1e-10):
+                entry_px, stop, target = positions[idx][0], positions[idx][1], positions[idx][2]
+                if "stop" in kinds and abs(stop - price) <= tol:
                     close_at(idx, stop, "stop")
-                elif "target" in kinds and abs(target - price) <= max(1e-6, abs(price) * 1e-10):
+                elif "target" in kinds and abs(target - price) <= tol:
                     close_at(idx, target, "take")
+            if breakeven_stop and "arm" in kinds:
+                for pos in positions:
+                    if len(pos) > 4 and pos[4] > 0 and abs(pos[4] - price) <= tol:
+                        pos[1] = pos[0]
+                        pos[4] = 0.0
+                        breakeven_moves += 1
             going_down = b < cur
             if "level" in kinds and going_down:
                 if price + 1e-8 < sma or not buys_ok:
                     skipped_trend += 1
+                elif rise_block:
+                    skipped_rise += 1
+                elif reentry_block_px > 0 and price < reentry_block_px:
+                    skipped_reentry += 1
                 else:
                     try_open(price)
             if going_down and price <= sma:
@@ -788,13 +851,20 @@ def simulate_slots(
         elif day != current_day:
             finish_day(current_day, last)
             current_day = day
+        rise_block = False
+        if block_rising_sma > 0:
+            prev_day = (
+                datetime.fromtimestamp(open_ms / 1000, timezone.utc) - timedelta(days=block_rising_sma)
+            ).strftime("%Y-%m-%d")
+            prev_sma = sma_by_day.get(prev_day)
+            rise_block = prev_sma is not None and sma > prev_sma
         if o != last:
-            buys_ok = walk(last, o, sma, buys_ok)
+            buys_ok = walk(last, o, sma, buys_ok, rise_block)
         path = (l, h, c) if c >= o else (h, l, c)
         prev = o
         for px in path:
             if px != prev:
-                buys_ok = walk(prev, px, sma, buys_ok)
+                buys_ok = walk(prev, px, sma, buys_ok, rise_block)
             prev = px
         last = c
         mark_extrema(c)
@@ -818,6 +888,10 @@ def simulate_slots(
         "sell_fills": sell_fills,
         "capped_buys": skipped_cap,
         "paused_buys": skipped_trend,
+        "paused_rise": skipped_rise,
+        "paused_reentry": skipped_reentry,
+        "breakeven_moves": breakeven_moves,
+        "trade_bps": trade_bps,
         "btc": btc,
         "cash": cash,
         "end_btc_frac": (btc * last / final_eq) if final_eq else 0.0,
