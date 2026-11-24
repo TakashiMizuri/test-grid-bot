@@ -1,0 +1,1 @@
+{"year": 2022, "variant": "arm75", "slippage_bps": 1.5, "maker_take": true, "return_pct": 30.33, "max_dd_pct": -15.74, "mean_dd_pct": -5.432, "wr_pct": 33.57, "expectancy_bps": 0.76, "mean_day_pct": 0.0915, "trades_per_day": 11.87, "takes": 1335, "stops": 2642, "breakeven_moves": 1754, "min_equity": 9131.19}

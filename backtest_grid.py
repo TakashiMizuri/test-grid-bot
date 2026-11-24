@@ -17,6 +17,7 @@ import json
 import math
 import urllib.request
 import zipfile
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -174,12 +175,19 @@ def build_levels(lower: float, upper: float) -> list[float]:
     return levels
 
 
-def band_levels(price: float, high: float, low: float) -> list[float]:
-    half = max((high - low) / price / 2, MIN_HALF_SPAN)
+def band_levels(
+    price: float,
+    high: float,
+    low: float,
+    target_step: float = TARGET_STEP,
+    min_half_span: float = MIN_HALF_SPAN,
+    max_intervals: int = 80,
+) -> list[float]:
+    half = max((high - low) / price / 2, min_half_span)
     lower = price * (1 - half)
     upper = price * (1 + half)
-    n = round(math.log(upper / lower) / math.log(1 + TARGET_STEP))
-    n = max(MAX_HOLD, min(80, n))
+    n = round(math.log(upper / lower) / math.log(1 + target_step))
+    n = max(MAX_HOLD, min(max_intervals, n))
     ratio = (upper / lower) ** (1 / n)
     levels = [lower * ratio**i for i in range(n + 1)]
     levels[0] = lower
@@ -526,6 +534,11 @@ def simulate_slots(
     reentry_step_block: bool = False,
     breakeven_stop: bool = False,
     slippage_bps: float = 0.0,
+    maker_take: bool = False,
+    target_step: float | None = None,
+    breakeven_arm_frac: float = 0.5,
+    breakeven_buffer_bps: float = 0.0,
+    min_range: float = 0.0,
 ) -> dict:
     """Six working slots. No opening seed.
     notional_leverage is the slot size as a fraction of equity: 1.0 is 100% of the
@@ -536,8 +549,16 @@ def simulate_slots(
     leaves the take a full step down. reentry_step_block refuses a new short until
     price has risen one full step above the latest stop. breakeven_stop moves the
     stop to the entry once price has covered half the way to the take.
+    breakeven_arm_frac is that fraction of the way. breakeven_buffer_bps parks the
+    moved stop that many basis points beyond the entry, on the adverse side.
+    min_range blocks a new entry when the prior 30-day high-low range, as a
+    fraction of price, is below that value. Open positions still exit.
     slippage_bps worsens the fill by that many basis points on entry and again
-    on exit. The order still triggers at the signal price.
+    on exit. The order still triggers at the signal price. maker_take leaves the
+    take fill at the signal price: that exit is a resting limit. Stops, including
+    the breakeven scratch, still pay slippage.
+    target_step overrides the 0.50% grid. The minimum corridor scales with it,
+    so a wider step is not squeezed back to 0.50% on a quiet month.
     block_rising_sma skips a new entry when today's
     SMA20 is above the SMA20 that many calendar days earlier. Open positions still
     exit only at their own stop or take. stop_mode "band" still sells leftovers only
@@ -561,6 +582,7 @@ def simulate_slots(
     skipped_trend = 0
     skipped_rise = 0
     skipped_reentry = 0
+    skipped_narrow = 0
     reentry_block_px = 0.0
     breakeven_moves = 0
     trade_bps: list[float] = []
@@ -615,10 +637,19 @@ def simulate_slots(
     def open_fill(price: float) -> float:
         return price * (1 - slip) if side == -1 else price * (1 + slip)
 
-    def close_fill(price: float) -> float:
+    def close_fill(price: float, kind: str) -> float:
+        if maker_take and kind == "take":
+            return price
         return price * (1 + slip) if side == -1 else price * (1 - slip)
 
-    levels = band_levels(entry_price, max(c[2] for c in warmup), min(c[3] for c in warmup))
+    step = TARGET_STEP if target_step is None else target_step
+    half_floor = MIN_HALF_SPAN if target_step is None else MIN_HALF_SPAN * (step / TARGET_STEP)
+
+    def levels_at(price: float, high: float, low: float) -> list[float]:
+        cap = 80 if target_step is None else 400
+        return band_levels(price, high, low, step, half_floor, cap)
+
+    levels = levels_at(entry_price, max(c[2] for c in warmup), min(c[3] for c in warmup))
     # entry, stop, target, qty — prices are fixed at the fill
     positions: list[list[float]] = []
 
@@ -626,7 +657,7 @@ def simulate_slots(
         nonlocal takes, stops, win_pnl, loss_pnl, first_stop_pnl, repeat_stop_pnl, first_stops, repeat_stops, fresh_take_pnl, reentry_take_pnl, reentry_takes, ambiguous_stops, ambiguous_stop_pnl, cash, btc, realized, sell_fills, reentry_block_px
         entry_px, _stop, target, qty = positions.pop(index)[:4]
         entry_fill = open_fill(entry_px)
-        exit_fill = close_fill(price)
+        exit_fill = close_fill(price, kind)
         if entry_fill > 0:
             trade_bps.append((exit_fill - entry_fill) / entry_fill * side * 10_000)
         if reentry_step_block and kind != "take" and _stop > entry_px:
@@ -679,11 +710,11 @@ def simulate_slots(
         if i + 1 < len(levels):
             target = levels[i + 1]
         else:
-            target = price * (1 + TARGET_STEP)
+            target = price * (1 + step)
         if i > 0:
             full_stop = levels[i - 1]
         else:
-            full_stop = price / (1 + TARGET_STEP)
+            full_stop = price / (1 + step)
         if side == 1 or adverse_frac is None:
             down = price - (price - full_stop) * stop_frac
             if target <= price or down >= price:
@@ -716,7 +747,7 @@ def simulate_slots(
         if qty > 0:
             slot = [price, adverse, favorable, qty]
             if breakeven_stop:
-                slot.append(price + 0.5 * (favorable - price))
+                slot.append(price + breakeven_arm_frac * (favorable - price))
             positions.append(slot)
 
     def events(cur: float, dest: float, sma: float) -> list[tuple[float, str]]:
@@ -741,8 +772,8 @@ def simulate_slots(
         consider(sma, "sma")
         return found
 
-    def walk(a: float, b: float, sma: float, buys_ok: bool, rise_block: bool) -> bool:
-        nonlocal skipped_trend, skipped_rise, skipped_reentry, reentry_block_px, breakeven_moves
+    def walk(a: float, b: float, sma: float, buys_ok: bool, rise_block: bool, narrow_block: bool) -> bool:
+        nonlocal skipped_trend, skipped_rise, skipped_reentry, skipped_narrow, reentry_block_px, breakeven_moves
         if reentry_block_px > 0 and max(a, b) >= reentry_block_px:
             reentry_block_px = 0.0
         cur = a
@@ -768,7 +799,8 @@ def simulate_slots(
             if breakeven_stop and "arm" in kinds:
                 for pos in positions:
                     if len(pos) > 4 and pos[4] > 0 and abs(pos[4] - price) <= tol:
-                        pos[1] = pos[0]
+                        buffer = breakeven_buffer_bps / 10_000
+                        pos[1] = pos[0] * (1 + buffer) if side == -1 else pos[0] * (1 - buffer)
                         pos[4] = 0.0
                         breakeven_moves += 1
             going_down = b < cur
@@ -777,6 +809,8 @@ def simulate_slots(
                     skipped_trend += 1
                 elif rise_block:
                     skipped_rise += 1
+                elif narrow_block:
+                    skipped_narrow += 1
                 elif reentry_block_px > 0 and price < reentry_block_px:
                     skipped_reentry += 1
                 else:
@@ -802,6 +836,25 @@ def simulate_slots(
     window: list[tuple[int, float, float]] = [
         (c[0], c[2], c[3]) for c in warmup if c[0] >= test_ms - 30 * 86_400_000
     ]
+    hi_q: deque[tuple[int, float]] = deque()
+    lo_q: deque[tuple[int, float]] = deque()
+
+    def push_span(ms: int, high: float, low: float) -> None:
+        cutoff_ms = ms - 30 * 86_400_000
+        while hi_q and hi_q[0][0] < cutoff_ms:
+            hi_q.popleft()
+        while lo_q and lo_q[0][0] < cutoff_ms:
+            lo_q.popleft()
+        while hi_q and hi_q[-1][1] <= high:
+            hi_q.pop()
+        hi_q.append((ms, high))
+        while lo_q and lo_q[-1][1] >= low:
+            lo_q.pop()
+        lo_q.append((ms, low))
+
+    if min_range > 0:
+        for ms, high, low in window:
+            push_span(ms, high, low)
 
     def mark_extrema(price: float) -> None:
         nonlocal peak, max_dd, max_frac
@@ -826,7 +879,7 @@ def simulate_slots(
         if close < levels[0] or close > levels[-1]:
             hh = max(item[1] for item in window)
             ll = min(item[2] for item in window)
-            levels = band_levels(close, hh, ll)
+            levels = levels_at(close, hh, ll)
             recenters += 1
         mark_extrema(close)
         eq = equity_at(close)
@@ -858,17 +911,22 @@ def simulate_slots(
             ).strftime("%Y-%m-%d")
             prev_sma = sma_by_day.get(prev_day)
             rise_block = prev_sma is not None and sma > prev_sma
+        narrow_block = False
+        if min_range > 0 and hi_q and lo_q and last > 0:
+            narrow_block = (hi_q[0][1] - lo_q[0][1]) / last < min_range
         if o != last:
-            buys_ok = walk(last, o, sma, buys_ok, rise_block)
+            buys_ok = walk(last, o, sma, buys_ok, rise_block, narrow_block)
         path = (l, h, c) if c >= o else (h, l, c)
         prev = o
         for px in path:
             if px != prev:
-                buys_ok = walk(prev, px, sma, buys_ok, rise_block)
+                buys_ok = walk(prev, px, sma, buys_ok, rise_block, narrow_block)
             prev = px
         last = c
         mark_extrema(c)
         window.append((open_ms, h, l))
+        if min_range > 0:
+            push_span(open_ms, h, l)
         cutoff = open_ms - 30 * 86_400_000
         while window and window[0][0] < cutoff:
             window.pop(0)
@@ -890,6 +948,7 @@ def simulate_slots(
         "paused_buys": skipped_trend,
         "paused_rise": skipped_rise,
         "paused_reentry": skipped_reentry,
+        "paused_narrow": skipped_narrow,
         "breakeven_moves": breakeven_moves,
         "trade_bps": trade_bps,
         "btc": btc,

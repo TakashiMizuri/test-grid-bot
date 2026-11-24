@@ -1,0 +1,1 @@
+{"year": 2026, "variant": "arm75", "slippage_bps": 1.5, "maker_take": true, "return_pct": -7.39, "max_dd_pct": -16.02, "mean_dd_pct": -5.8979, "wr_pct": 32.83, "expectancy_bps": -0.25, "mean_day_pct": -0.0202, "trades_per_day": 7.85, "takes": 763, "stops": 1561, "breakeven_moves": 1004, "min_equity": 8637.56}

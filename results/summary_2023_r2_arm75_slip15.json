@@ -1,0 +1,1 @@
+{"year": 2023, "variant": "arm75", "slippage_bps": 1.5, "maker_take": true, "return_pct": 17.22, "max_dd_pct": -28.36, "mean_dd_pct": -4.837, "wr_pct": 33.76, "expectancy_bps": 0.32, "mean_day_pct": 0.0608, "trades_per_day": 18.63, "takes": 2107, "stops": 4134, "breakeven_moves": 2753, "min_equity": 9560.63}

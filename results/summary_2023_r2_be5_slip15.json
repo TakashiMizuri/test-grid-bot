@@ -1,0 +1,1 @@
+{"year": 2023, "variant": "be5", "slippage_bps": 1.5, "maker_take": true, "return_pct": 18.26, "max_dd_pct": -27.09, "mean_dd_pct": -4.6688, "wr_pct": 31.05, "expectancy_bps": 0.3, "mean_day_pct": 0.063, "trades_per_day": 20.25, "takes": 2107, "stops": 4678, "breakeven_moves": 3682, "min_equity": 9422.36}
