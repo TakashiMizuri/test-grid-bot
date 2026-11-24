@@ -539,6 +539,7 @@ def simulate_slots(
     breakeven_arm_frac: float = 0.5,
     breakeven_buffer_bps: float = 0.0,
     min_range: float = 0.0,
+    intrabar: dict[int, list[tuple[float, float, float, float]]] | None = None,
 ) -> dict:
     """Six working slots. No opening seed.
     notional_leverage is the slot size as a fraction of equity: 1.0 is 100% of the
@@ -559,6 +560,9 @@ def simulate_slots(
     the breakeven scratch, still pay slippage.
     target_step overrides the 0.50% grid. The minimum corridor scales with it,
     so a wider step is not squeezed back to 0.50% on a quiet month.
+    intrabar walks the minute candles inside a bar in time order. The bar itself
+    still sets the corridor and the daily marks. Without it, a bar goes open, then
+    low before high when the close is at or above the open, then close.
     block_rising_sma skips a new entry when today's
     SMA20 is above the SMA20 that many calendar days earlier. Open positions still
     exit only at their own stop or take. stop_mode "band" still sells leftovers only
@@ -920,15 +924,21 @@ def simulate_slots(
         narrow_block = False
         if min_range > 0 and hi_q and lo_q and last > 0:
             narrow_block = (hi_q[0][1] - lo_q[0][1]) / last < min_range
-        if o != last:
-            buys_ok = walk(last, o, sma, buys_ok, rise_block, narrow_block)
-        path = (l, h, c) if c >= o else (h, l, c)
-        prev = o
-        for px in path:
-            if px != prev:
-                buys_ok = walk(prev, px, sma, buys_ok, rise_block, narrow_block)
-            prev = px
-        last = c
+        segments = intrabar.get(open_ms) if intrabar else None
+        if not segments:
+            segments = [(o, h, l, c)]
+        for so, sh, sl, sc in segments:
+            bar_high = sh
+            bar_low = sl
+            if so != last:
+                buys_ok = walk(last, so, sma, buys_ok, rise_block, narrow_block)
+            path = (sl, sh, sc) if sc >= so else (sh, sl, sc)
+            prev = so
+            for px in path:
+                if px != prev:
+                    buys_ok = walk(prev, px, sma, buys_ok, rise_block, narrow_block)
+                prev = px
+            last = sc
         mark_extrema(c)
         window.append((open_ms, h, l))
         if min_range > 0:
