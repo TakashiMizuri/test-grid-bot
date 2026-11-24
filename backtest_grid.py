@@ -646,7 +646,13 @@ def simulate_slots(
     half_floor = MIN_HALF_SPAN if target_step is None else MIN_HALF_SPAN * (step / TARGET_STEP)
 
     def levels_at(price: float, high: float, low: float) -> list[float]:
-        cap = 80 if target_step is None else 400
+        # 400 intervals keep a 0.25% step on a 30-day range up to about 90% of
+        # price. A finer step needs proportionally more, or a wide month opens
+        # wider than requested. The unset path stays at the historical cap of 80.
+        if target_step is None:
+            cap = 80
+        else:
+            cap = max(400, math.ceil(400 * 0.0025 / step))
         return band_levels(price, high, low, step, half_floor, cap)
 
     levels = levels_at(entry_price, max(c[2] for c in warmup), min(c[3] for c in warmup))
